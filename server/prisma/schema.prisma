@@ -1,0 +1,835 @@
+// Beverage Distribution System — Database Schema
+// Source of truth: BeverageDistribution_SRS_v2.2_Final.pdf §12
+// All IDs are UUIDs. All timestamps are UTC. Soft deletes on user-facing records.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ─── Enums ──────────────────────────────────────────────────────────────
+
+enum Role {
+  salesman
+  driver
+  super_admin
+  sales_manager
+  inventory_manager
+  finance_manager
+  pos_cashier
+}
+
+enum Language {
+  ur
+  en
+}
+
+enum UnitType {
+  bottle
+  crate
+  carton
+}
+
+enum RetailerStatus {
+  active
+  suspended
+  inactive
+}
+
+enum HealthState {
+  active
+  growing
+  at_risk
+  inactive
+}
+
+enum VisitType {
+  order
+  no_order
+}
+
+enum OrderStatus {
+  pending_approval
+  pending
+  assigned
+  delivered
+  partial
+  failed
+  cancelled
+}
+
+enum DiscountType {
+  pct
+  pkr
+  none
+}
+
+enum DiscountApprovalStatus {
+  pending
+  approved
+  rejected
+}
+
+enum DeliveryStatus {
+  delivered
+  partial
+  failed
+  not_home
+}
+
+enum PaymentMethod {
+  cash
+  credit
+  digital
+}
+
+enum POSPaymentMethod {
+  cash
+  digital
+}
+
+enum PeriodType {
+  daily
+  weekly
+  monthly
+}
+
+enum StockMovementType {
+  grn
+  load
+  deliver
+  return
+  adjustment
+  pos_sale
+}
+
+// ─── Master Data ────────────────────────────────────────────────────────
+
+model User {
+  id             String    @id @default(uuid()) @db.Uuid
+  name           String
+  phone          String    @unique
+  role           Role
+  pinHash        String    @map("pin_hash")
+  isActive       Boolean   @default(true) @map("is_active")
+  isDeleted      Boolean   @default(false) @map("is_deleted")
+  language       Language  @default(en)
+  // Salesman / POS Cashier discount limits (nullable for other roles)
+  maxDiscountPct Decimal?  @map("max_discount_pct") @db.Decimal(5, 2)
+  maxDiscountPkr Decimal?  @map("max_discount_pkr") @db.Decimal(14, 2)
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  zones               UserZone[]
+  retailersAsSalesman Retailer[]          @relation("RetailerPrimarySalesman")
+  retailersApproved   Retailer[]          @relation("RetailerCreditApprover")
+  retailerPricesSet   RetailerPrice[]
+  targets             SalesmanTarget[]
+  visits              Visit[]
+  ordersAsSalesman    Order[]             @relation("OrderSalesman")
+  ordersAsDriver      Order[]             @relation("OrderDriver")
+  ordersAssigned      Order[]             @relation("OrderAssignedBy")
+  discountRequests    DiscountApproval[]  @relation("DiscountRequester")
+  discountReviews     DiscountApproval[]  @relation("DiscountReviewer")
+  deliveryProofs      DeliveryProof[]     @relation("DeliveryDriver")
+  deliveryOverrides   DeliveryProof[]     @relation("DeliveryOverrider")
+  paymentsCollected   Payment[]           @relation("PaymentCollector")
+  paymentsReconciled  Payment[]           @relation("PaymentReconciler")
+  vehicleStock        VehicleStock[]
+  stockMovements      StockMovement[]
+  posSales            PosSale[]           @relation("PosCashier")
+  posSalesVoided      PosSale[]           @relation("PosVoider")
+  grnReceipts         GrnRecord[]
+  auditEvents         AuditLog[]
+  ledgerEntriesCreated SupplierLedgerEntry[] @relation("LedgerEntryCreator")
+  purchasesCreated     SupplierPurchase[]    @relation("PurchaseCreator")
+  expensesCreated      Expense[]             @relation("ExpenseCreator")
+
+  @@index([role])
+  @@index([isActive, isDeleted])
+  @@map("users")
+}
+
+model Zone {
+  id          String   @id @default(uuid()) @db.Uuid
+  name        String
+  city        String
+  description String?
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  userZones UserZone[]
+  retailers Retailer[]
+  orders    Order[]
+
+  @@unique([name, city])
+  @@map("zones")
+}
+
+model UserZone {
+  id           String   @id @default(uuid()) @db.Uuid
+  userId       String   @map("user_id") @db.Uuid
+  zoneId       String   @map("zone_id") @db.Uuid
+  assignedDate DateTime @default(now()) @map("assigned_date")
+  isActive     Boolean  @default(true) @map("is_active")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+  zone Zone @relation(fields: [zoneId], references: [id], onDelete: Restrict)
+
+  @@unique([userId, zoneId])
+  @@index([zoneId, isActive])
+  @@map("user_zones")
+}
+
+model Retailer {
+  id                      String         @id @default(uuid()) @db.Uuid
+  shopName                String         @map("shop_name")
+  ownerName               String         @map("owner_name")
+  phone                   String
+  // Nullable: the web admin panel can create a retailer without coordinates
+  // (no map picker there). The salesman mobile app still captures a GPS pin
+  // on registration (FEAT-6).
+  gpsLat                  Decimal?       @map("gps_lat") @db.Decimal(10, 7)
+  gpsLng                  Decimal?       @map("gps_lng") @db.Decimal(10, 7)
+  zoneId                  String         @map("zone_id") @db.Uuid
+  primarySalesmanId       String         @map("primary_salesman_id") @db.Uuid
+  // Credit limit recommended by salesman, approved by admin (SRS D2)
+  creditLimit             Decimal        @default(0) @map("credit_limit") @db.Decimal(14, 2)
+  creditLimitApproved     Boolean        @default(false) @map("credit_limit_approved")
+  creditLimitApprovedBy   String?        @map("credit_limit_approved_by") @db.Uuid
+  outstandingBalance      Decimal        @default(0) @map("outstanding_balance") @db.Decimal(14, 2)
+  // Override of global default; null = use company_settings default
+  overdueThresholdDays    Int?           @map("overdue_threshold_days")
+  healthState             HealthState    @default(active) @map("health_state")
+  status                  RetailerStatus @default(active)
+  isDeleted               Boolean        @default(false) @map("is_deleted")
+  registeredAt            DateTime       @default(now()) @map("registered_at")
+  updatedAt               DateTime       @updatedAt @map("updated_at")
+
+  zone               Zone            @relation(fields: [zoneId], references: [id], onDelete: Restrict)
+  primarySalesman    User            @relation("RetailerPrimarySalesman", fields: [primarySalesmanId], references: [id], onDelete: Restrict)
+  creditLimitApprover User?          @relation("RetailerCreditApprover", fields: [creditLimitApprovedBy], references: [id], onDelete: SetNull)
+  specialPrices      RetailerPrice[]
+  visits             Visit[]
+  orders             Order[]
+  payments           Payment[]
+
+  @@index([zoneId])
+  @@index([primarySalesmanId])
+  @@index([healthState])
+  @@index([status])
+  @@map("retailers")
+}
+
+model Product {
+  id        String   @id @default(uuid()) @db.Uuid
+  sku       String   @unique
+  name      String
+  category  String?
+  // Cola Next purchase-matrix taxonomy (nullable — only the flavour×pack-size
+  // catalog is tagged). Values come from the fixed code lists; a (flavour,
+  // packSize) pair identifies the product behind a grid cell.
+  flavour   String?
+  packSize  String?  @map("pack_size")
+  // Each SKU has one unit type per SRS D14
+  unitType  UnitType @map("unit_type")
+  basePrice Decimal  @map("base_price") @db.Decimal(14, 2)
+  isActive  Boolean  @default(true) @map("is_active")
+  isDeleted Boolean  @default(false) @map("is_deleted")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  warehouseStock   WarehouseStock?
+  specialPrices    RetailerPrice[]
+  orderItems       OrderItem[]
+  vehicleStock     VehicleStock[]
+  stockMovements   StockMovement[]
+  posSaleItems     PosSaleItem[]
+  grnRecords       GrnRecord[]
+  purchaseItems    SupplierPurchaseItem[]
+
+  @@index([isActive, isDeleted])
+  @@map("products")
+}
+
+model RetailerPrice {
+  id           String   @id @default(uuid()) @db.Uuid
+  retailerId   String   @map("retailer_id") @db.Uuid
+  productId    String   @map("product_id") @db.Uuid
+  // Becomes the effective floor for this retailer/product pair (SRS §11)
+  specialPrice Decimal  @map("special_price") @db.Decimal(14, 2)
+  setBy        String   @map("set_by") @db.Uuid
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  retailer Retailer @relation(fields: [retailerId], references: [id], onDelete: Cascade)
+  product  Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+  setter   User     @relation(fields: [setBy], references: [id], onDelete: Restrict)
+
+  @@unique([retailerId, productId])
+  @@map("retailer_prices")
+}
+
+model WarehouseStock {
+  id                 String   @id @default(uuid()) @db.Uuid
+  productId          String   @unique @map("product_id") @db.Uuid
+  quantityOnHand     Int      @default(0) @map("quantity_on_hand")
+  lowStockThreshold  Int      @default(0) @map("low_stock_threshold")
+  updatedAt          DateTime @updatedAt @map("updated_at")
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@map("warehouse_stock")
+}
+
+model SalesmanTarget {
+  id                  String     @id @default(uuid()) @db.Uuid
+  salesmanId          String     @map("salesman_id") @db.Uuid
+  periodType          PeriodType @map("period_type")
+  targetOrderValuePkr Decimal    @map("target_order_value_pkr") @db.Decimal(14, 2)
+  targetVisitCount    Int        @map("target_visit_count")
+  effectiveFrom       DateTime   @map("effective_from")
+  effectiveTo         DateTime?  @map("effective_to")
+
+  salesman User @relation(fields: [salesmanId], references: [id], onDelete: Cascade)
+
+  @@index([salesmanId, periodType, effectiveFrom])
+  @@map("salesman_targets")
+}
+
+// ─── Field Activity ─────────────────────────────────────────────────────
+
+model Visit {
+  id         String    @id @default(uuid()) @db.Uuid
+  salesmanId String    @map("salesman_id") @db.Uuid
+  retailerId String    @map("retailer_id") @db.Uuid
+  orderId    String?   @map("order_id") @db.Uuid
+  visitType  VisitType @map("visit_type")
+  note       String?
+  visitedAt  DateTime  @default(now()) @map("visited_at")
+
+  salesman User      @relation(fields: [salesmanId], references: [id], onDelete: Restrict)
+  retailer Retailer  @relation(fields: [retailerId], references: [id], onDelete: Restrict)
+  order    Order?    @relation(fields: [orderId], references: [id], onDelete: SetNull)
+
+  @@index([salesmanId, visitedAt])
+  @@index([retailerId, visitedAt])
+  @@map("visits")
+}
+
+// Sequential per-year counter backing the human-readable order_number.
+// One row per calendar year; lastSeq incremented under a row lock inside
+// the order-creation transaction so numbers are gapless and race-safe.
+model OrderCounter {
+  year    Int @id
+  lastSeq Int @default(0) @map("last_seq")
+
+  @@map("order_counters")
+}
+
+model Order {
+  id            String      @id @default(uuid()) @db.Uuid
+  // Human-readable reference label: ORD-YYYY-NNNNNN. Display only — the UUID
+  // id remains the real PK and all FKs. No pricing/lock/state-machine impact.
+  orderNumber   String      @unique @map("order_number") @db.VarChar(20)
+  retailerId    String      @map("retailer_id") @db.Uuid
+  salesmanId    String      @map("salesman_id") @db.Uuid
+  zoneId        String      @map("zone_id") @db.Uuid
+  driverId      String?     @map("driver_id") @db.Uuid
+  status        OrderStatus @default(pending)
+  // delivery_date = order_date + 1 enforced in app layer (SRS D9)
+  orderDate     DateTime    @map("order_date") @db.Date
+  deliveryDate  DateTime    @map("delivery_date") @db.Date
+  note          String?     @db.VarChar(200)
+  totalValuePkr Decimal     @default(0) @map("total_value_pkr") @db.Decimal(14, 2)
+  retryCount    Int         @default(0) @map("retry_count")
+  // Null = use company-wide default
+  maxRetries    Int?        @map("max_retries")
+  assignedAt    DateTime?   @map("assigned_at")
+  assignedBy    String?     @map("assigned_by") @db.Uuid
+  createdAt     DateTime    @default(now()) @map("created_at")
+  updatedAt     DateTime    @updatedAt @map("updated_at")
+
+  retailer          Retailer            @relation(fields: [retailerId], references: [id], onDelete: Restrict)
+  salesman          User                @relation("OrderSalesman", fields: [salesmanId], references: [id], onDelete: Restrict)
+  zone              Zone                @relation(fields: [zoneId], references: [id], onDelete: Restrict)
+  driver            User?               @relation("OrderDriver", fields: [driverId], references: [id], onDelete: SetNull)
+  assignedByUser    User?               @relation("OrderAssignedBy", fields: [assignedBy], references: [id], onDelete: SetNull)
+  items             OrderItem[]
+  discountApprovals DiscountApproval[]
+  deliveryProofs    DeliveryProof[]
+  payments          Payment[]
+  visits            Visit[]
+
+  @@index([salesmanId, orderDate])
+  @@index([driverId, deliveryDate])
+  @@index([retailerId, orderDate])
+  @@index([zoneId, orderDate])
+  @@index([status])
+  @@map("orders")
+}
+
+model OrderItem {
+  id                    String       @id @default(uuid()) @db.Uuid
+  orderId               String       @map("order_id") @db.Uuid
+  productId             String       @map("product_id") @db.Uuid
+  unitType              UnitType     @map("unit_type")
+  qtyOrdered            Int          @map("qty_ordered")
+  qtyDelivered          Int?         @map("qty_delivered")
+  unitPrice             Decimal      @map("unit_price") @db.Decimal(14, 2)
+  // Snapshot of special price applied at time of order (if any)
+  specialPriceApplied   Decimal?     @map("special_price_applied") @db.Decimal(14, 2)
+  discountType          DiscountType @default(none) @map("discount_type")
+  discountValue         Decimal      @default(0) @map("discount_value") @db.Decimal(14, 2)
+  effectiveUnitPrice    Decimal      @map("effective_unit_price") @db.Decimal(14, 2)
+  // True if server recalculated price during sync — surfaces SRS §5.1 notification
+  priceRevisedOnSync    Boolean      @default(false) @map("price_revised_on_sync")
+
+  order   Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([orderId])
+  @@index([productId])
+  @@map("order_items")
+}
+
+model DiscountApproval {
+  id               String                 @id @default(uuid()) @db.Uuid
+  orderId          String                 @map("order_id") @db.Uuid
+  requestedBy      String                 @map("requested_by") @db.Uuid
+  reviewedBy       String?                @map("reviewed_by") @db.Uuid
+  status           DiscountApprovalStatus @default(pending)
+  rejectionReason  String?                @map("rejection_reason")
+  requestedAt      DateTime               @default(now()) @map("requested_at")
+  reviewedAt       DateTime?              @map("reviewed_at")
+
+  order     Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  requester User  @relation("DiscountRequester", fields: [requestedBy], references: [id], onDelete: Restrict)
+  reviewer  User? @relation("DiscountReviewer", fields: [reviewedBy], references: [id], onDelete: SetNull)
+
+  @@index([status])
+  @@index([orderId])
+  @@map("discount_approvals")
+}
+
+model DeliveryProof {
+  id              String         @id @default(uuid()) @db.Uuid
+  orderId         String         @map("order_id") @db.Uuid
+  driverId        String         @map("driver_id") @db.Uuid
+  status          DeliveryStatus
+  reasonCode      String?        @map("reason_code")
+  photoUrl        String?        @map("photo_url")
+  photoUploaded   Boolean        @default(false) @map("photo_uploaded")
+  gpsLat          Decimal?       @map("gps_lat") @db.Decimal(10, 7)
+  gpsLng          Decimal?       @map("gps_lng") @db.Decimal(10, 7)
+  confirmedAt     DateTime       @default(now()) @map("confirmed_at")
+  // Populated only on Super Admin override (SRS D33)
+  overrideBy      String?        @map("override_by") @db.Uuid
+  overrideReason  String?        @map("override_reason")
+
+  order      Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  driver     User  @relation("DeliveryDriver", fields: [driverId], references: [id], onDelete: Restrict)
+  overrider  User? @relation("DeliveryOverrider", fields: [overrideBy], references: [id], onDelete: SetNull)
+
+  @@index([orderId])
+  @@index([driverId, confirmedAt])
+  @@map("delivery_proofs")
+}
+
+model Payment {
+  id            String        @id @default(uuid()) @db.Uuid
+  orderId       String        @map("order_id") @db.Uuid
+  retailerId    String        @map("retailer_id") @db.Uuid
+  driverId      String        @map("driver_id") @db.Uuid
+  amountPkr     Decimal       @map("amount_pkr") @db.Decimal(14, 2)
+  method        PaymentMethod
+  referenceNo   String?       @map("reference_no")
+  dueDate       DateTime?     @map("due_date") @db.Date
+  collectedAt   DateTime      @default(now()) @map("collected_at")
+  reconciled    Boolean       @default(false)
+  reconciledAt  DateTime?     @map("reconciled_at")
+  reconciledBy  String?       @map("reconciled_by") @db.Uuid
+
+  order             Order    @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  retailer          Retailer @relation(fields: [retailerId], references: [id], onDelete: Restrict)
+  driver            User     @relation("PaymentCollector", fields: [driverId], references: [id], onDelete: Restrict)
+  reconcilerUser    User?    @relation("PaymentReconciler", fields: [reconciledBy], references: [id], onDelete: SetNull)
+
+  // One payment per order (DR19): structural guard against the duplicate-payment
+  // race (two sync retries double-incrementing the retailer's outstanding).
+  @@unique([orderId])
+  @@index([driverId, collectedAt])
+  @@index([retailerId, collectedAt])
+  @@index([reconciled])
+  // Serves outstandingAgeing(): oldest unreconciled credit payment per
+  // retailer (filters retailerId + method + reconciled, aggregates collectedAt).
+  @@index([retailerId, method, reconciled, collectedAt])
+  @@map("payments")
+}
+
+// ─── Inventory ──────────────────────────────────────────────────────────
+
+model VehicleStock {
+  id                  String   @id @default(uuid()) @db.Uuid
+  driverId            String   @map("driver_id") @db.Uuid
+  shiftDate           DateTime @map("shift_date") @db.Date
+  productId           String   @map("product_id") @db.Uuid
+  unitType            UnitType @map("unit_type")
+  qtyLoaded           Int      @map("qty_loaded")
+  qtyDelivered        Int      @default(0) @map("qty_delivered")
+  qtyReturnedLogged   Int?     @map("qty_returned_logged")
+  // Warehouse manager physical verification (SRS D16)
+  qtyReturnedVerified Int?     @map("qty_returned_verified")
+  discrepancyFlag     Boolean  @default(false) @map("discrepancy_flag")
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  driver  User    @relation(fields: [driverId], references: [id], onDelete: Restrict)
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@unique([driverId, shiftDate, productId, unitType])
+  @@index([shiftDate])
+  // The EOD pending-returns queue filters on qtyReturnedVerified IS NULL ordered
+  // by shiftDate; without this the filter was an unindexed full scan (INV-1).
+  @@index([qtyReturnedVerified, shiftDate])
+  @@map("vehicle_stock")
+}
+
+model StockMovement {
+  id           String            @id @default(uuid()) @db.Uuid
+  productId    String            @map("product_id") @db.Uuid
+  movementType StockMovementType @map("movement_type")
+  qty          Int
+  unitType     UnitType          @map("unit_type")
+  // Refers to grn/order/vehicle_stock/pos_sale ID depending on movement_type
+  referenceId  String?           @map("reference_id") @db.Uuid
+  actorId      String            @map("actor_id") @db.Uuid
+  reasonCode   String?           @map("reason_code")
+  note         String?
+  createdAt    DateTime          @default(now()) @map("created_at")
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+  actor   User    @relation(fields: [actorId], references: [id], onDelete: Restrict)
+
+  @@index([productId, createdAt])
+  @@index([movementType, createdAt])
+  @@map("stock_movements")
+}
+
+model GrnRecord {
+  id           String   @id @default(uuid()) @db.Uuid
+  productId    String   @map("product_id") @db.Uuid
+  qtyReceived  Int      @map("qty_received")
+  unitType     UnitType @map("unit_type")
+  supplierRef  String?  @map("supplier_ref")
+  receivedBy   String   @map("received_by") @db.Uuid
+  receivedAt   DateTime @default(now()) @map("received_at")
+
+  product  Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+  receiver User    @relation(fields: [receivedBy], references: [id], onDelete: Restrict)
+
+  @@index([productId, receivedAt])
+  @@map("grn_records")
+}
+
+// ─── POS ────────────────────────────────────────────────────────────────
+
+model PosSale {
+  id            String           @id @default(uuid()) @db.Uuid
+  cashierId     String           @map("cashier_id") @db.Uuid
+  totalPkr      Decimal          @map("total_pkr") @db.Decimal(14, 2)
+  discountPkr   Decimal          @default(0) @map("discount_pkr") @db.Decimal(14, 2)
+  paymentMethod POSPaymentMethod @map("payment_method")
+  referenceNo   String?          @map("reference_no")
+  voided        Boolean          @default(false)
+  voidedBy      String?          @map("voided_by") @db.Uuid
+  voidedAt      DateTime?        @map("voided_at")
+  createdAt     DateTime         @default(now()) @map("created_at")
+
+  cashier User          @relation("PosCashier", fields: [cashierId], references: [id], onDelete: Restrict)
+  voider  User?         @relation("PosVoider", fields: [voidedBy], references: [id], onDelete: SetNull)
+  items   PosSaleItem[]
+
+  @@index([cashierId, createdAt])
+  @@index([createdAt])
+  @@map("pos_sales")
+}
+
+model PosSaleItem {
+  id             String   @id @default(uuid()) @db.Uuid
+  posSaleId      String   @map("pos_sale_id") @db.Uuid
+  productId      String   @map("product_id") @db.Uuid
+  unitType       UnitType @map("unit_type")
+  qty            Int
+  unitPrice      Decimal  @map("unit_price") @db.Decimal(14, 2)
+  effectivePrice Decimal  @map("effective_price") @db.Decimal(14, 2)
+
+  posSale PosSale @relation(fields: [posSaleId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([posSaleId])
+  @@map("pos_sale_items")
+}
+
+// ─── System ─────────────────────────────────────────────────────────────
+
+model SystemAlert {
+  id           String   @id @default(uuid()) @db.Uuid
+  alertType    String   @map("alert_type")
+  message      String
+  triggeredAt  DateTime @default(now()) @map("triggered_at")
+  // JSON array of user IDs who have seen this alert
+  seenBy       Json     @default("[]") @map("seen_by")
+  resolved     Boolean  @default(false)
+
+  @@index([alertType, resolved])
+  @@index([triggeredAt])
+  @@map("system_alerts")
+}
+
+// Immutable — SRS §15.2. No update/delete endpoint.
+model AuditLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  actorId    String   @map("actor_id") @db.Uuid
+  action     String
+  entityType String   @map("entity_type")
+  entityId   String   @map("entity_id") @db.Uuid
+  oldValue   Json?    @map("old_value")
+  newValue   Json?    @map("new_value")
+  ipAddress  String?  @map("ip_address")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  actor User @relation(fields: [actorId], references: [id], onDelete: Restrict)
+
+  @@index([actorId, createdAt])
+  @@index([entityType, entityId])
+  @@map("audit_log")
+}
+
+// Single-row table — SRS §9.7
+model CompanySettings {
+  id                       String   @id @default(uuid()) @db.Uuid
+  name                     String
+  logoUrl                  String?  @map("logo_url")
+  address                  String?
+  ntn                      String?
+  contactPhone             String?  @map("contact_phone")
+  contactEmail             String?  @map("contact_email")
+  currency                 String   @default("PKR")
+  city                     String
+  deliveryRetryLimit       Int      @default(2) @map("delivery_retry_limit")
+  alertBalanceThreshold    Decimal  @default(0) @map("alert_balance_threshold") @db.Decimal(14, 2)
+  // HH:MM format
+  idleSalesmanCheckTime    String   @default("12:00") @map("idle_salesman_check_time")
+  zoneFailureThreshold     Int      @default(3) @map("zone_failure_threshold")
+  posCashierDiscountLimit  Decimal  @default(0) @map("pos_cashier_discount_limit") @db.Decimal(14, 2)
+  updatedAt                DateTime @updatedAt @map("updated_at")
+  updatedBy                String?  @map("updated_by") @db.Uuid
+
+  @@map("company_settings")
+}
+
+// SRS §5.3/§16: queued offline mutations (delivery confirm, payment, order
+// create, …) retry unlimited/until-flag. Without dedupe a retried-but-
+// already-applied request double-applies (double payment, double stock
+// decrement). The client sends a stable Idempotency-Key (its sync_queue row
+// id); the first apply stores the response, replays return it verbatim.
+model IdempotencyKey {
+  key       String   @id
+  scope     String
+  response  Json
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([createdAt])
+  @@map("idempotency_keys")
+}
+
+// Server-side refresh-token store (jti = id). Enables single-use rotation,
+// logout, and revocation that stateless JWTs alone can't provide. On refresh
+// the presented token is revoked and a new row is issued (replacedById links
+// the chain); a revoked token whose replacement is still live re-mints that
+// replacement (lost-response recovery for flaky field networks).
+model RefreshToken {
+  id           String    @id @db.Uuid
+  userId       String    @map("user_id") @db.Uuid
+  expiresAt    DateTime  @map("expires_at")
+  revokedAt    DateTime? @map("revoked_at")
+  replacedById String?   @map("replaced_by_id") @db.Uuid
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+// ─── Upstream company ledger, supplier purchases & expenses (S10) ──────────
+
+enum LedgerEntryType {
+  stock_purchase
+  fare
+  funds_paid
+  incentive
+  discount
+  adjustment
+  opening_balance
+}
+
+enum LedgerDirection {
+  debit
+  credit
+}
+
+enum IncentivePeriod {
+  monthly
+  quarterly
+  annual
+}
+
+enum ExpensePaymentMethod {
+  cash
+  digital
+  cheque
+  credit
+}
+
+// The principal beverage company the distributor buys from. One row in MVP
+// (schema is multi-ready). Balance is derived from ledger entries — no
+// denormalized balance column.
+model Supplier {
+  id           String   @id @default(uuid()) @db.Uuid
+  name         String   @unique
+  contactPhone String?  @map("contact_phone")
+  address      String?
+  ntn          String?
+  isActive     Boolean  @default(true) @map("is_active")
+  isDeleted    Boolean  @default(false) @map("is_deleted")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  ledgerEntries SupplierLedgerEntry[]
+  purchases     SupplierPurchase[]
+
+  @@map("suppliers")
+}
+
+// The company ledger book. Balance = openingBalance + Σdebit − Σcredit,
+// computed on read (lib/ledger.ts). Debits = stock_purchase, fare; credits =
+// funds_paid, incentive, discount. adjustment/opening_balance carry an
+// explicit direction.
+model SupplierLedgerEntry {
+  id              String           @id @default(uuid()) @db.Uuid
+  supplierId      String           @map("supplier_id") @db.Uuid
+  entryType       LedgerEntryType  @map("entry_type")
+  direction       LedgerDirection
+  amountPkr       Decimal          @map("amount_pkr") @db.Decimal(14, 2)
+  entryDate       DateTime         @map("entry_date") @db.Date
+  referenceNo     String?          @map("reference_no")
+  incentivePeriod IncentivePeriod? @map("incentive_period")
+  periodLabel     String?          @map("period_label")
+  note            String?          @db.VarChar(280)
+  purchaseId      String?          @map("purchase_id") @db.Uuid
+  createdBy       String           @map("created_by") @db.Uuid
+  isDeleted       Boolean          @default(false) @map("is_deleted")
+  createdAt       DateTime         @default(now()) @map("created_at")
+
+  supplier Supplier          @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  purchase SupplierPurchase? @relation(fields: [purchaseId], references: [id], onDelete: Restrict)
+  creator  User              @relation("LedgerEntryCreator", fields: [createdBy], references: [id], onDelete: Restrict)
+
+  @@index([supplierId, entryDate])
+  @@index([purchaseId])
+  @@map("supplier_ledger_entries")
+}
+
+// One row = one company invoice. Committing a purchase atomically receives
+// stock (WarehouseStock + StockMovement) and posts ledger entries. Immutable
+// after commit — corrections via stock adjustment + ledger adjustment.
+model SupplierPurchase {
+  id             String   @id @default(uuid()) @db.Uuid
+  supplierId     String   @map("supplier_id") @db.Uuid
+  purchaseNumber String   @unique @map("purchase_number") @db.VarChar(20)
+  purchaseDate   DateTime @map("purchase_date") @db.Date
+  supplierRef    String?  @map("supplier_ref")
+  subtotalPkr    Decimal  @map("subtotal_pkr") @db.Decimal(14, 2)
+  farePkr        Decimal  @default(0) @map("fare_pkr") @db.Decimal(14, 2)
+  discountPkr    Decimal  @default(0) @map("discount_pkr") @db.Decimal(14, 2)
+  totalPkr       Decimal  @map("total_pkr") @db.Decimal(14, 2)
+  note           String?  @db.VarChar(200)
+  createdBy      String   @map("created_by") @db.Uuid
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  supplier      Supplier               @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  creator       User                   @relation("PurchaseCreator", fields: [createdBy], references: [id], onDelete: Restrict)
+  items         SupplierPurchaseItem[]
+  ledgerEntries SupplierLedgerEntry[]
+
+  @@index([supplierId, purchaseDate])
+  @@map("supplier_purchases")
+}
+
+model SupplierPurchaseItem {
+  id           String   @id @default(uuid()) @db.Uuid
+  purchaseId   String   @map("purchase_id") @db.Uuid
+  productId    String   @map("product_id") @db.Uuid
+  unitType     UnitType @map("unit_type")
+  qtyReceived  Int      @map("qty_received")
+  unitCostPkr  Decimal  @map("unit_cost_pkr") @db.Decimal(14, 2)
+  lineTotalPkr Decimal  @map("line_total_pkr") @db.Decimal(14, 2)
+
+  purchase SupplierPurchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+  product  Product          @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([purchaseId])
+  @@index([productId])
+  @@map("supplier_purchase_items")
+}
+
+// Per-year counter for gapless PUR-YYYY-NNNNNN numbers (mirrors OrderCounter).
+model PurchaseCounter {
+  year    Int @id
+  lastSeq Int @default(0) @map("last_seq")
+
+  @@map("purchase_counters")
+}
+
+model ExpenseCategory {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String   @unique
+  isActive  Boolean  @default(true) @map("is_active")
+  isDeleted Boolean  @default(false) @map("is_deleted")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  expenses Expense[]
+
+  @@map("expense_categories")
+}
+
+model Expense {
+  id            String               @id @default(uuid()) @db.Uuid
+  categoryId    String               @map("category_id") @db.Uuid
+  amountPkr     Decimal              @map("amount_pkr") @db.Decimal(14, 2)
+  expenseDate   DateTime             @map("expense_date") @db.Date
+  payee         String?
+  paymentMethod ExpensePaymentMethod @map("payment_method")
+  referenceNo   String?              @map("reference_no")
+  note          String?              @db.VarChar(280)
+  receiptUrl    String?              @map("receipt_url")
+  isDeleted     Boolean              @default(false) @map("is_deleted")
+  createdBy     String               @map("created_by") @db.Uuid
+  createdAt     DateTime             @default(now()) @map("created_at")
+  updatedAt     DateTime             @updatedAt @map("updated_at")
+
+  category ExpenseCategory @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  creator  User            @relation("ExpenseCreator", fields: [createdBy], references: [id], onDelete: Restrict)
+
+  @@index([expenseDate])
+  @@index([categoryId, expenseDate])
+  @@map("expenses")
+}
